@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+huggingface_hub>=0.30
+youtube-transcript-api>=1.0
+pillow
+edge-tts>=7.0
