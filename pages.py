@@ -160,7 +160,10 @@ def panel(t):
 def layout(title, desc, path, body, base, jsonld=None, robots="index,follow"):
     full_title = f"{title} | {SITE}" if title != SITE else f"{SITE} | أدوات ذكاء اصطناعي بالعربية"
     nav = "".join(f'<a href="/tools/{t["slug"]}">{esc(t["name"])}</a>' for t in TOOLS)
-    ld = "".join(f'<script type="application/ld+json">{json.dumps(j, ensure_ascii=False).replace("</", "<\\/")}</script>' for j in (jsonld or []))
+    def _ld(j):
+        data = json.dumps(j, ensure_ascii=False).replace("</", "<\\/")
+        return '<script type="application/ld+json">' + data + '</script>'
+    ld = "".join(_ld(j) for j in (jsonld or []))
     adsense = (f'<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={esc(ADSENSE_CLIENT)}" crossorigin="anonymous"></script>'
                if ADSENSE_CLIENT else "")
     return f'''<!doctype html>
