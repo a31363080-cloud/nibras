@@ -1,7 +1,9 @@
 """نبراس: خادم توليد الصور وتلخيص الفيديو بالعربية.
 
 المتغيرات البيئية (Secrets في HF Space):
-  HF_TOKEN       مطلوب. توكن Hugging Face بصلاحية Inference.
+  CF_ACCOUNT_ID + CF_API_TOKEN   مزود Cloudflare Workers AI (حصة مجانية يومية). له الأولوية إن وُجد.
+  HF_TOKEN       بديل: توكن Hugging Face بصلاحية Inference (يحتاج رصيداً).
+  CF_LLM_MODEL   اختياري. الافتراضي @cf/meta/llama-3.3-70b-instruct-fp8-fast
   IMAGE_MODEL    اختياري. الافتراضي black-forest-labs/FLUX.1-schnell
   LLM_MODEL      اختياري. الافتراضي Qwen/Qwen2.5-72B-Instruct
   SITE_URL       اختياري لكن مهم: عنوان الموقع النهائي (https://example.com) لـ sitemap وcanonical
@@ -24,6 +26,11 @@ from pydantic import BaseModel, Field
 import pages
 
 HF_TOKEN = os.getenv("HF_TOKEN", "")
+CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
+CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
+CF_LLM_MODEL = os.getenv("CF_LLM_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+USE_CF = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen2.5-72B-Instruct")
 
@@ -36,9 +43,34 @@ app = FastAPI(title="نبراس")
 
 def _client():
     if not HF_TOKEN:
-        raise HTTPException(503, "الخادم غير مهيأ: ضع HF_TOKEN في إعدادات Space.")
+        raise HTTPException(503, "الخادم غير مهيأ: لم يُضبط مزود الذكاء الاصطناعي.")
     from huggingface_hub import InferenceClient
     return InferenceClient(token=HF_TOKEN, timeout=120)
+
+
+def _cf_run(path: str, payload: dict) -> dict:
+    """يستدعي Cloudflare Workers AI عبر REST (بلا مكتبات إضافية)."""
+    import json
+    import urllib.error
+    import urllib.request
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/{path}"
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), method="POST",
+        headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")[:200]
+        if e.code in (401, 403):
+            raise HTTPException(503, "مفتاح Cloudflare غير صالح أو بلا صلاحية Workers AI.")
+        if e.code == 429:
+            raise HTTPException(429, "انتهت الحصة المجانية اليومية. حاول غداً.")
+        raise HTTPException(502, f"خطأ من Cloudflare ({e.code}): {body}")
+    if not data.get("success", True):
+        raise HTTPException(502, f"خطأ من Cloudflare: {str(data.get('errors'))[:160]}")
+    return data.get("result") or {}
 
 
 def _limit(request: Request, kind: str):
@@ -55,6 +87,18 @@ def _limit(request: Request, kind: str):
 
 
 def _chat(system: str, user: str, max_tokens: int = 900) -> str:
+    if USE_CF:
+        res = _cf_run(f"run/{CF_LLM_MODEL}", {
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "max_tokens": max_tokens, "temperature": 0.3,
+        })
+        text = res.get("response")
+        if text is None and res.get("choices"):
+            text = res["choices"][0]["message"]["content"]
+        text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+        if not text:
+            raise HTTPException(502, "لم يرجع النموذج نتيجة. حاول مرة أخرى.")
+        return text
     out = _client().chat_completion(
         model=LLM_MODEL,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -99,11 +143,20 @@ def make_image(req: ImageReq, request: Request):
     w, h = SIZES.get(req.size, SIZES["1:1"])
     try:
         prompt = to_english_prompt(req.prompt.strip(), req.style)
+        if USE_CF:
+            res = _cf_run(f"run/{CF_IMAGE_MODEL}", {"prompt": prompt, "steps": 6})
+            b64 = res.get("image")
+            if not b64:
+                raise HTTPException(502, "لم تُرجع الخدمة صورة. حاول مرة أخرى.")
+            return {"image": "data:image/jpeg;base64," + b64, "prompt": prompt}
         img = _client().text_to_image(prompt, model=IMAGE_MODEL, width=w, height=h)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(502, f"فشل توليد الصورة: {str(e)[:160]}")
+        msg = str(e)
+        if "402" in msg:
+            raise HTTPException(503, "رصيد خدمة الذكاء الاصطناعي انتهى. أخبر مدير الموقع.")
+        raise HTTPException(502, f"فشل توليد الصورة: {msg[:160]}")
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=88)
     return {"image": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(), "prompt": prompt}
@@ -169,13 +222,15 @@ def summarize(req: SumReq, request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if "402" in str(e):
+            raise HTTPException(503, "رصيد خدمة الذكاء الاصطناعي انتهى. أخبر مدير الموقع.")
         raise HTTPException(502, f"فشل التلخيص: {str(e)[:160]}")
     return {"summary": summary, "chars": min(len(text), MAX_CHARS)}
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "configured": bool(HF_TOKEN)}
+    return {"ok": True, "configured": bool(USE_CF or HF_TOKEN), "provider": "cloudflare" if USE_CF else "huggingface"}
 
 
 # ---------------------------------------------------------------- الصوت
@@ -260,6 +315,8 @@ def text_tool(req: TextReq, request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if "402" in str(e):
+            raise HTTPException(503, "رصيد خدمة الذكاء الاصطناعي انتهى. أخبر مدير الموقع.")
         raise HTTPException(502, f"فشلت المعالجة: {str(e)[:160]}")
     raise HTTPException(400, "أداة غير معروفة.")
 
