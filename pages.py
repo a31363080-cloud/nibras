@@ -157,6 +157,38 @@ def panel(t):
 <div class="result" id="tres" hidden><pre id="tout" dir="auto"></pre><div class="actions"><button class="btn" id="tcopy">نسخ النتيجة</button></div></div></section>'''
 
 
+# ------------------------------------------------------------------ هوية الموقع
+def _lamp(cls=""):
+    return (f'<svg class="{cls}" viewBox="0 0 32 32" aria-hidden="true">'
+            '<path class="lamp-stroke" d="M12 6.5C12.5 2 19.5 2 20 6.5M10 8.5h12l-1.5 3h-9zM11 11.5C8 15.5 8 21.5 11 25.5h10c3-4 3-10 0-14M12 27.5h8"/>'
+            '<path class="lamp-flame" d="M16 14.5c3 3.2 3.4 5.4 0 8.6-3.4-3.2-3-5.4 0-8.6z"/></svg>')
+
+
+_ICON = {
+    "text-to-speech": '<path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>',
+    "image-generator": '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="M4 17l5-4.5 3.5 3L16 12l4 4"/>',
+    "video-summarizer": '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M10.5 9.5v5l4.5-2.5z"/>',
+    "arabic-tashkeel": '<path d="M7 18c0-5 3-8 6-8 2 0 3 1 3 3s-1.5 3-3 3"/><path d="M9 5.5l4 1.5"/>',
+    "arabic-proofreader": '<path d="M5 12.5l4.500 4.500L19 7.500"/><path d="M4 20h16"/>',
+    "text-summarizer": '<path d="M4 6h16M4 11h16M4 16h10"/><path d="M17 16l1.5 1.5L21 15"/>',
+}
+
+
+def _ico(slug):
+    return f'<i class="ico"><svg viewBox="0 0 24 24" aria-hidden="true">{_ICON.get(slug, "")}</svg></i>'
+
+
+def _card(t):
+    return (f'<a class="card" href="/tools/{t["slug"]}">{_ico(t["slug"])}'
+            f'<div><b>{esc(t["name"])}</b><span>{esc(t["blurb"])}</span></div></a>')
+
+
+_THEME_BTN = ('<button class="theme-btn" id="theme" type="button" aria-label="تبديل الوضع الليلي">'
+              '<svg class="moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.500 4a8 8 0 1 0 10.500 10.500z"/></svg>'
+              '<svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5.2 5.2l1.800 1.800M17 17l1.800 1.800M5.2 18.8L7 17M17 7l1.800-1.800"/></svg>'
+              '</button>')
+
+
 def layout(title, desc, path, body, base, jsonld=None, robots="index,follow"):
     full_title = f"{title} | {SITE}" if title != SITE else f"{SITE} | أدوات ذكاء اصطناعي بالعربية"
     nav = "".join(f'<a href="/tools/{t["slug"]}">{esc(t["name"])}</a>' for t in TOOLS)
@@ -176,12 +208,13 @@ def layout(title, desc, path, body, base, jsonld=None, robots="index,follow"):
 <meta property="og:type" content="website"><meta property="og:locale" content="ar_AR">
 <meta property="og:title" content="{esc(full_title)}"><meta property="og:description" content="{esc(desc)}"><meta property="og:url" content="{esc(base + path)}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Reem+Kufi:wght@500;700&family=IBM+Plex+Sans+Arabic:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Aref+Ruqaa:wght@400;700&family=IBM+Plex+Sans+Arabic:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="/static/style.css">
+<script>try{{var t=localStorage.getItem("nibras-theme");if(t)document.documentElement.setAttribute("data-theme",t)}}catch(e){{}}</script>
 {adsense}{ld}
 </head><body>
 <div class="wrap">
-<header><a class="brand" href="/">نب<span>راس</span></a><nav class="top" aria-label="الأدوات">{nav}</nav></header>
+<header><a class="brand" href="/">{_lamp()}<div>نب<span>راس</span></div></a><nav class="top" aria-label="الأدوات">{nav}</nav>{_THEME_BTN}</header>
 {body}
 <footer><div class="flinks"><a href="/about">من نحن</a><a href="/privacy">سياسة الخصوصية</a><a href="/contact">تواصل معنا</a></div>
 <div>{SITE} · أدوات ذكاء اصطناعي بالعربية</div></footer>
@@ -192,10 +225,10 @@ def layout(title, desc, path, body, base, jsonld=None, robots="index,follow"):
 
 # ------------------------------------------------------------------ صفحات
 def home(base):
-    cards = "".join(
-        f'<a class="card" href="/tools/{t["slug"]}"><b>{esc(t["name"])}</b><span>{esc(t["blurb"])}</span></a>' for t in TOOLS)
-    body = f'''<section class="hero"><h1>أدوات ذكاء اصطناعي بالعربية</h1>
-<p>حوّل النص إلى صوت، ولّد الصور من وصف عربي، لخّص الفيديوهات والمقالات، وشكّل النصوص ودقّقها. مجاناً وبلا تسجيل.</p></section>
+    cards = "".join(_card(t) for t in TOOLS)
+    body = f'''<section class="hero hero-home"><div><h1>أدوات ذكاء اصطناعي بالعربية</h1>
+<p>حوّل النص إلى صوت، ولّد الصور من وصف عربي، لخّص الفيديوهات والمقالات، وشكّل النصوص ودقّقها. مجاناً وبلا تسجيل.</p></div>
+<div class="hero-lamp">{_lamp()}</div></section>
 <div class="cards">{cards}</div>{ad(True)}
 <section class="how"><div><b>بالعربية أولاً</b><span>واجهة من اليمين إلى اليسار وأدوات تفهم العربية.</span></div>
 <div><b>بلا تسجيل</b><span>افتح الأداة واستخدمها فوراً.</span></div>
@@ -207,8 +240,7 @@ def home(base):
 def tool_page(t, base):
     steps = "".join(f"<li>{esc(s)}</li>" for s in t["steps"])
     faqs = "".join(f"<details><summary>{esc(q)}</summary><p>{esc(a)}</p></details>" for q, a in t["faqs"])
-    related = "".join(f'<a class="card" href="/tools/{o["slug"]}"><b>{esc(o["name"])}</b><span>{esc(o["blurb"])}</span></a>'
-                      for o in TOOLS if o["slug"] != t["slug"])
+    related = "".join(_card(o) for o in TOOLS if o["slug"] != t["slug"])
     body = f'''<section class="hero"><h1>{esc(t["title"])}</h1><p>{esc(t["intro"])}</p></section>
 <div class="grid"><div>{panel(t)}</div><aside>{ad()}</aside></div>
 <section class="prose"><h2>طريقة الاستخدام</h2><ol>{steps}</ol>
