@@ -1,375 +1,148 @@
-"""نبراس: خادم توليد الصور وتلخيص الفيديو بالعربية.
-
-المتغيرات البيئية (Secrets في HF Space):
-  CF_ACCOUNT_ID + CF_API_TOKEN   مزود Cloudflare Workers AI (حصة مجانية يومية). له الأولوية إن وُجد.
-  HF_TOKEN       بديل: توكن Hugging Face بصلاحية Inference (يحتاج رصيداً).
-  CF_LLM_MODEL   اختياري. الافتراضي @cf/meta/llama-3.3-70b-instruct-fp8-fast
-  IMAGE_MODEL    اختياري. الافتراضي black-forest-labs/FLUX.1-schnell
-  LLM_MODEL      اختياري. الافتراضي Qwen/Qwen2.5-72B-Instruct
-  SITE_URL       اختياري لكن مهم: عنوان الموقع النهائي (https://example.com) لـ sitemap وcanonical
-  ADSENSE_CLIENT / ADSENSE_SLOT   اختياري: لتفعيل الإعلانات
-  CONTACT_EMAIL  بريد صفحة التواصل
-"""
-import base64
-import io
-import os
-import re
-import time
-from collections import defaultdict, deque
-from typing import Optional
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-
-import pages
-
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
-CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
-CF_LLM_MODEL = os.getenv("CF_LLM_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
-CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
-USE_CF = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
-LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen2.5-72B-Instruct")
-
-# حد بسيط للطلبات لكل عنوان IP: (عدد الطلبات، المدة بالثواني)
-LIMITS = {"image": (6, 3600), "summarize": (10, 3600), "text": (30, 3600), "tts": (30, 3600)}
-_hits: dict = defaultdict(deque)
-
-app = FastAPI(title="نبراس")
-
-
-def _client():
-    if not HF_TOKEN:
-        raise HTTPException(503, "الخادم غير مهيأ: لم يُضبط مزود الذكاء الاصطناعي.")
-    from huggingface_hub import InferenceClient
-    return InferenceClient(token=HF_TOKEN, timeout=120)
-
-
-def _cf_run(path: str, payload: dict) -> dict:
-    """يستدعي Cloudflare Workers AI عبر REST (بلا مكتبات إضافية)."""
-    import json
-    import urllib.error
-    import urllib.request
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/{path}"
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), method="POST",
-        headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="ignore")[:200]
-        if e.code in (401, 403):
-            raise HTTPException(503, "مفتاح Cloudflare غير صالح أو بلا صلاحية Workers AI.")
-        if e.code == 429:
-            raise HTTPException(429, "انتهت الحصة المجانية اليومية. حاول غداً.")
-        raise HTTPException(502, f"خطأ من Cloudflare ({e.code}): {body}")
-    if not data.get("success", True):
-        raise HTTPException(502, f"خطأ من Cloudflare: {str(data.get('errors'))[:160]}")
-    return data.get("result") or {}
-
-
-def _limit(request: Request, kind: str):
-    ip = (request.headers.get("x-forwarded-for") or request.client.host or "?").split(",")[0].strip()
-    n, window = LIMITS[kind]
-    q = _hits[(kind, ip)]
-    now = time.time()
-    while q and now - q[0] > window:
-        q.popleft()
-    if len(q) >= n:
-        wait = int(window - (now - q[0])) // 60 + 1
-        raise HTTPException(429, f"وصلت للحد المسموح. حاول بعد {wait} دقيقة.")
-    q.append(now)
-
-
-def _chat(system: str, user: str, max_tokens: int = 900) -> str:
-    if USE_CF:
-        res = _cf_run(f"run/{CF_LLM_MODEL}", {
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "max_tokens": max_tokens, "temperature": 0.3,
-        })
-        text = res.get("response")
-        if text is None and res.get("choices"):
-            text = res["choices"][0]["message"]["content"]
-        text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
-        if not text:
-            raise HTTPException(502, "لم يرجع النموذج نتيجة. حاول مرة أخرى.")
-        return text
-    out = _client().chat_completion(
-        model=LLM_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=max_tokens,
-        temperature=0.3,
-    )
-    return out.choices[0].message.content.strip()
-
-
-# ---------------------------------------------------------------- الصور
-STYLES = {
-    "واقعي": "photorealistic, natural lighting, high detail",
-    "رسم زيتي": "oil painting, visible brush strokes, rich colors",
-    "كرتوني": "cartoon illustration, clean outlines, vibrant flat colors",
-    "ثلاثي الأبعاد": "3D render, soft studio lighting, high detail",
-}
-SIZES = {"1:1": (1024, 1024), "16:9": (1280, 720), "9:16": (720, 1280)}
-
-
-class ImageReq(BaseModel):
-    prompt: str = Field(min_length=3, max_length=500)
-    style: str = "واقعي"
-    size: str = "1:1"
-
-
-def to_english_prompt(text: str, style: str) -> str:
-    """يترجم الوصف العربي إلى وصف إنجليزي مناسب لنموذج الصور."""
-    if not re.search(r"[؀-ۿ]", text):
-        return f"{text}, {STYLES.get(style, '')}"
-    en = _chat(
-        "You turn Arabic image descriptions into one concise English image-generation prompt. "
-        "Output only the prompt, no quotes, no explanation.",
-        text,
-        max_tokens=120,
-    )
-    return f"{en}, {STYLES.get(style, '')}"
-
-
-@app.post("/api/image")
-def make_image(req: ImageReq, request: Request):
-    _limit(request, "image")
-    w, h = SIZES.get(req.size, SIZES["1:1"])
-    try:
-        prompt = to_english_prompt(req.prompt.strip(), req.style)
-        if USE_CF:
-            res = _cf_run(f"run/{CF_IMAGE_MODEL}", {"prompt": prompt, "steps": 6})
-            b64 = res.get("image")
-            if not b64:
-                raise HTTPException(502, "لم تُرجع الخدمة صورة. حاول مرة أخرى.")
-            return {"image": "data:image/jpeg;base64," + b64, "prompt": prompt}
-        img = _client().text_to_image(prompt, model=IMAGE_MODEL, width=w, height=h)
-    except HTTPException:
-        raise
-    except Exception as e:
-        msg = str(e)
-        if "402" in msg:
-            raise HTTPException(503, "رصيد خدمة الذكاء الاصطناعي انتهى. أخبر مدير الموقع.")
-        raise HTTPException(502, f"فشل توليد الصورة: {msg[:160]}")
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=88)
-    return {"image": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(), "prompt": prompt}
-
-
-# ---------------------------------------------------------------- التلخيص
-_YT_ID = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
-LENGTHS = {"قصير": "5 bullet points", "متوسط": "10 bullet points", "مفصل": "a detailed summary with headings"}
-LANGS = {"العربية": "Arabic", "English": "English", "Français": "French"}
-MAX_CHARS = 24000  # حوالي 30-40 دقيقة من الكلام
-
-
-class SumReq(BaseModel):
-    url: Optional[str] = None
-    transcript: Optional[str] = Field(default=None, max_length=60000)
-    length: str = "قصير"
-    lang: str = "العربية"
-
-
-def video_id(url: str) -> str:
-    m = _YT_ID.search(url or "")
-    if not m:
-        raise HTTPException(400, "الرابط غير صالح. استخدم رابط يوتيوب كاملاً.")
-    return m.group(1)
-
-
-def fetch_transcript(vid: str) -> str:
-    from youtube_transcript_api import YouTubeTranscriptApi
-    try:
-        t = YouTubeTranscriptApi().fetch(vid, languages=["ar", "en", "fr", "es"])
-        return " ".join(s.text for s in t)
-    except Exception as e:
-        raise HTTPException(
-            422,
-            "تعذّر جلب نص الفيديو (قد لا يملك ترجمة، أو يحجب يوتيوب عناوين الخادم). "
-            "الصق نص الفيديو في الخانة الثانية بدلاً من الرابط.",
-        ) from e
-
-
-def summarize_text(text: str, length_label: str, lang_label: str) -> str:
-    text = re.sub(r"\s+", " ", text)[:MAX_CHARS]
-    key = re.sub(r"[\u064B-\u0652]", "", length_label).split(" ")[0]
-    length = LENGTHS.get(key, LENGTHS["قصير"])
-    lang = LANGS.get(lang_label, "Arabic")
-    return _chat(
-        f"You summarize texts and video transcripts. Write in {lang}. Output {length}. "
-        "Use only what the text says. Do not invent facts. Start with a one-line title.",
-        text,
-        max_tokens=1100,
-    )
-
-
-@app.post("/api/summarize")
-def summarize(req: SumReq, request: Request):
-    _limit(request, "summarize")
-    text = (req.transcript or "").strip()
-    if not text:
-        text = fetch_transcript(video_id(req.url or ""))
-    if len(text) < 200:
-        raise HTTPException(400, "النص قصير جداً للتلخيص.")
-    try:
-        summary = summarize_text(text, req.length, req.lang)
-    except HTTPException:
-        raise
-    except Exception as e:
-        if "402" in str(e):
-            raise HTTPException(503, "رصيد خدمة الذكاء الاصطناعي انتهى. أخبر مدير الموقع.")
-        raise HTTPException(502, f"فشل التلخيص: {str(e)[:160]}")
-    return {"summary": summary, "chars": min(len(text), MAX_CHARS)}
-
-
-@app.get("/api/health")
-def health():
-    return {"ok": True, "configured": bool(USE_CF or HF_TOKEN), "provider": "cloudflare" if USE_CF else "huggingface"}
-
-
-# ---------------------------------------------------------------- الصوت
-TTS_VOICES = {
-    "ar-DZ-IsmaelNeural": "عربي جزائري · إسماعيل (رجل)",
-    "ar-DZ-AminaNeural": "عربي جزائري · أمينة (امرأة)",
-    "ar-SA-HamedNeural": "عربي سعودي · حامد (رجل)",
-    "ar-SA-ZariyahNeural": "عربي سعودي · زارية (امرأة)",
-    "ar-EG-SalmaNeural": "عربي مصري · سلمى (امرأة)",
-    "ar-EG-ShakirNeural": "عربي مصري · شاكر (رجل)",
-    "fr-FR-DeniseNeural": "Français · Denise",
-    "en-US-AriaNeural": "English · Aria",
-}
-
-
-class TtsReq(BaseModel):
-    text: str = Field(min_length=1, max_length=3000)
-    voice: str = "ar-DZ-IsmaelNeural"
-    rate: float = 1.0
-    pitch: float = 1.0
-
-
-@app.get("/api/tts/voices")
-def tts_voices():
-    return [{"id": k, "name": v} for k, v in TTS_VOICES.items()]
-
-
-@app.post("/api/tts")
-async def tts(req: TtsReq, request: Request):
-    _limit(request, "tts")
-    if req.voice not in TTS_VOICES:
-        raise HTTPException(400, "صوت غير معروف.")
-    text = req.text.strip()
-    if not text:
-        raise HTTPException(400, "اكتب نصاً أولاً.")
-    rate = max(-50, min(60, round((req.rate - 1) * 100)))
-    pitch = max(-30, min(30, round((req.pitch - 1) * 50)))
-    try:
-        import edge_tts
-        comm = edge_tts.Communicate(text, req.voice, rate=f"{rate:+d}%", pitch=f"{pitch:+d}Hz")
-        audio = b""
-        async for chunk in comm.stream():
-            if chunk["type"] == "audio":
-                audio += chunk["data"]
-    except Exception as e:
-        raise HTTPException(502, "تعذّر توليد الصوت من الخادم. جرّب صوت الجهاز من القائمة.") from e
-    if not audio:
-        raise HTTPException(502, "لم يصل صوت من الخادم. جرّب صوت الجهاز من القائمة.")
-    return Response(audio, media_type="audio/mpeg")
-
-
-# ---------------------------------------------------------------- أدوات النص
-TEXT_PROMPTS = {
-    "tashkeel": ("Add full Arabic diacritics (tashkeel) to the user's text. Do not add, remove or change any word. "
-                 "Output only the diacritized text.", 2000),
-    "proofread": ("Correct spelling, grammar and punctuation in the user's Arabic text. Keep the wording, tone and meaning; "
-                  "change only what is wrong. Output only the corrected text.", 3000),
-}
-
-
-class TextReq(BaseModel):
-    mode: str
-    text: str = Field(min_length=3, max_length=12000)
-    length: str = "قصير"
-    lang: str = "العربية"
-
-
-@app.post("/api/text")
-def text_tool(req: TextReq, request: Request):
-    _limit(request, "text")
-    text = req.text.strip()
-    try:
-        if req.mode in TEXT_PROMPTS:
-            system, cap = TEXT_PROMPTS[req.mode]
-            if len(text) > cap:
-                raise HTTPException(400, f"النص أطول من {cap} حرفاً.")
-            return {"result": _chat(system, text, max_tokens=3500)}
-        if req.mode == "summarize":
-            if len(text) < 200:
-                raise HTTPException(400, "النص قصير جداً للتلخيص.")
-            return {"result": summarize_text(text, req.length, req.lang)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        if "402" in str(e):
-            raise HTTPException(503, "رصيد خدمة الذكاء الاصطناعي انتهى. أخبر مدير الموقع.")
-        raise HTTPException(502, f"فشلت المعالجة: {str(e)[:160]}")
-    raise HTTPException(400, "أداة غير معروفة.")
-
-
-# ---------------------------------------------------------------- الصفحات
-def _base(request: Request) -> str:
-    return (os.getenv("SITE_URL") or str(request.base_url)).rstrip("/")
-
-
-@app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    return pages.home(_base(request))
-
-
-@app.get("/tools/{slug}", response_class=HTMLResponse)
-def tool(slug: str, request: Request):
-    t = pages.BY_SLUG.get(slug)
-    if not t:
-        raise HTTPException(404, "الصفحة غير موجودة")
-    return pages.tool_page(t, _base(request))
-
-
-@app.get("/about", response_class=HTMLResponse)
-def about(request: Request):
-    return pages.about(_base(request))
-
-
-@app.get("/privacy", response_class=HTMLResponse)
-def privacy(request: Request):
-    return pages.privacy(_base(request))
-
-
-@app.get("/contact", response_class=HTMLResponse)
-def contact(request: Request):
-    return pages.contact(_base(request))
-
-
-@app.get("/sitemap.xml")
-def sitemap(request: Request):
-    return Response(pages.sitemap(_base(request)), media_type="application/xml")
-
-
-@app.get("/robots.txt", response_class=PlainTextResponse)
-def robots(request: Request):
-    return f"User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: {_base(request)}/sitemap.xml\n"
-
-
-@app.get("/ads.txt", response_class=PlainTextResponse)
-def ads_txt():
-    pub = pages.ADSENSE_CLIENT.replace("ca-", "")
-    if not pub:
-        raise HTTPException(404)
-    return f"google.com, {pub}, DIRECT, f08c47fec0942fa0\n"
-
-
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+(function () {
+  function $(id) { return document.getElementById(id); }
+
+  function post(path, body) {
+    return fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (j) {
+          if (!r.ok) throw new Error(typeof j.detail === 'string' ? j.detail : 'حدث خطأ. حاول مرة أخرى.');
+          return j;
+        });
+      });
+  }
+  function busy(btn, st, on, txt) { btn.disabled = on; st.textContent = on ? txt : ''; }
+  function copy(text, btn) {
+    var done = function () { var o = btn.textContent; btn.textContent = 'تم النسخ'; setTimeout(function () { btn.textContent = o; }, 1500); };
+    try { navigator.clipboard.writeText(text).then(done, function () {}); } catch (e) {}
+  }
+
+  // ---------- الوضع الليلي
+  var themeBtn = $('theme');
+  if (themeBtn) themeBtn.addEventListener('click', function () {
+    var root = document.documentElement, cur = root.getAttribute('data-theme');
+    if (!cur) cur = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    var next = cur === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('nibras-theme', next); } catch (e) {}
+  });
+
+  // ---------- نص إلى صوت (أصوات الموقع + أصوات الجهاز)
+  if ($('txt')) {
+    var txt = $('txt'), cnt = $('cnt'), sel = $('voice'), rate = $('rate'), pitch = $('pitch'),
+        note = $('ttsNote'), st = $('tts-st'), synth = window.speechSynthesis, devVoices = [], audio = null, audioUrl = null;
+    var upd = function () { cnt.textContent = txt.value.length; };
+    txt.addEventListener('input', upd); upd();
+    rate.addEventListener('input', function () { $('rv').textContent = (+rate.value).toFixed(1); });
+    pitch.addEventListener('input', function () { $('pv').textContent = (+pitch.value).toFixed(1); });
+    var msg = function (t, ok) { note.hidden = !t; note.textContent = t || ''; note.className = 'note' + (ok ? ' ok' : ''); };
+
+    function fill(server) {
+      sel.innerHTML = '';
+      var g1 = document.createElement('optgroup'); g1.label = 'أصوات الموقع (تعمل على كل الأجهزة)';
+      server.forEach(function (v) { var o = document.createElement('option'); o.value = 'srv:' + v.id; o.textContent = v.name; g1.appendChild(o); });
+      if (server.length) sel.appendChild(g1);
+      if (synth) {
+        var all = synth.getVoices();
+        var ar = all.filter(function (v) { return /^ar/i.test(v.lang); });
+        devVoices = ar.length ? ar : all;
+        var g2 = document.createElement('optgroup'); g2.label = 'أصوات جهازك' + (ar.length ? '' : ' (بلا عربية)');
+        devVoices.forEach(function (v, i) { var o = document.createElement('option'); o.value = 'dev:' + i; o.textContent = v.name + ' (' + v.lang + ')'; g2.appendChild(o); });
+        if (devVoices.length) sel.appendChild(g2);
+      }
+    }
+    var serverVoices = [];
+    fetch('/api/tts/voices').then(function (r) { return r.ok ? r.json() : []; }).catch(function () { return []; })
+      .then(function (v) { serverVoices = v; fill(serverVoices); if (!v.length && synth) msg('تعذّر تحميل أصوات الموقع، استخدم صوت جهازك.'); });
+    if (synth) synth.onvoiceschanged = function () { var cur = sel.value; fill(serverVoices); if (cur) sel.value = cur; };
+
+    function stopAll() {
+      if (synth) synth.cancel();
+      if (audio) { audio.pause(); audio = null; }
+      if (audioUrl) { URL.revokeObjectURL(audioUrl); audioUrl = null; }
+    }
+    $('play').addEventListener('click', function () {
+      if (audio && audio.paused && audio.currentTime > 0 && !audio.ended) { audio.play(); return; }
+      if (synth && synth.paused) { synth.resume(); return; }
+      stopAll(); msg('');
+      var t = txt.value.trim(); if (!t) { msg('اكتب نصاً أولاً.'); return; }
+      var val = sel.value || '';
+      if (val.indexOf('srv:') === 0) {
+        var btn = $('play'); btn.disabled = true; st.textContent = 'جارٍ تجهيز الصوت...';
+        fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: t, voice: val.slice(4), rate: +rate.value, pitch: +pitch.value }) })
+          .then(function (r) {
+            if (!r.ok) return r.json().catch(function () { return {}; }).then(function (j) { throw new Error(typeof j.detail === 'string' ? j.detail : 'تعذّر توليد الصوت.'); });
+            return r.blob();
+          })
+          .then(function (b) { audioUrl = URL.createObjectURL(b); audio = new Audio(audioUrl); return audio.play(); })
+          .catch(function (e) { msg(e && /[\u0600-\u06FF]/.test(e.message || '') ? e.message : 'تعذّر تشغيل الصوت. جرّب صوتاً آخر.'); })
+          .then(function () { btn.disabled = false; st.textContent = ''; });
+        return;
+      }
+      if (!synth) { msg('هذا المتصفح لا يدعم أصوات الجهاز. اختر أحد أصوات الموقع.'); return; }
+      var u = new SpeechSynthesisUtterance(t);
+      var v = devVoices[+val.slice(4)]; if (v) { u.voice = v; u.lang = v.lang; } else u.lang = 'ar-SA';
+      u.rate = +rate.value; u.pitch = +pitch.value;
+      u.onerror = function () { msg('تعذّر التشغيل. جرّب صوتاً آخر.'); };
+      synth.speak(u);
+    });
+    $('pause').addEventListener('click', function () { if (audio) audio.pause(); if (synth) synth.pause(); });
+    $('stop').addEventListener('click', stopAll);
+  }
+
+  // ---------- توليد الصور
+  if ($('igo')) {
+    document.querySelectorAll('#styles button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        document.querySelectorAll('#styles button').forEach(function (x) { x.setAttribute('aria-pressed', 'false'); });
+        b.setAttribute('aria-pressed', 'true');
+      });
+    });
+    var igo = $('igo');
+    igo.addEventListener('click', function () {
+      var err = $('ierr'), res = $('ires');
+      var style = document.querySelector('#styles button[aria-pressed="true"]').textContent;
+      var size = $('size').value.split(' ')[1] || '1:1';
+      err.hidden = true; res.hidden = true; busy(igo, $('ist'), true, 'جارٍ التوليد، قد يستغرق دقيقة...');
+      post('/api/image', { prompt: $('ip').value, style: style, size: size }).then(function (j) {
+        $('iimg').src = j.image; $('idl').href = j.image; res.hidden = false;
+      }).catch(function (e) { err.textContent = e.message; err.hidden = false; })
+        .then(function () { busy(igo, $('ist'), false); });
+    });
+  }
+
+  // ---------- تلخيص الفيديو
+  if ($('vgo')) {
+    var vgo = $('vgo');
+    vgo.addEventListener('click', function () {
+      var err = $('verr'), res = $('vres');
+      var t = $('vt').value.trim(), u = $('vu').value.trim();
+      if (!t && !u) { err.textContent = 'ضع رابط فيديو أو الصق نصه.'; err.hidden = false; return; }
+      err.hidden = true; res.hidden = true; busy(vgo, $('vst'), true, 'جارٍ التلخيص...');
+      post('/api/summarize', { url: u || null, transcript: t || null, length: $('vl').value, lang: $('vo').value }).then(function (j) {
+        $('vsum').textContent = j.summary; res.hidden = false;
+      }).catch(function (e) { err.textContent = e.message; err.hidden = false; })
+        .then(function () { busy(vgo, $('vst'), false); });
+    });
+    $('vcopy').addEventListener('click', function () { copy($('vsum').textContent, $('vcopy')); });
+  }
+
+  // ---------- أدوات النص (تشكيل / تدقيق / تلخيص)
+  if ($('tgo')) {
+    var mode = $('text').dataset.mode, tx = $('tx'), tgo = $('tgo');
+    var tu = function () { $('tcnt').textContent = tx.value.length; };
+    tx.addEventListener('input', tu); tu();
+    tgo.addEventListener('click', function () {
+      var err = $('terr'), res = $('tres');
+      if (tx.value.trim().length < 3) { err.textContent = 'الصق نصاً أولاً.'; err.hidden = false; return; }
+      err.hidden = true; res.hidden = true; busy(tgo, $('tst'), true, 'جارٍ المعالجة...');
+      post('/api/text', {
+        mode: mode, text: tx.value,
+        length: $('tl') ? $('tl').value : 'قصير', lang: $('to') ? $('to').value : 'العربية'
+      }).then(function (j) { $('tout').textContent = j.result; res.hidden = false; })
+        .catch(function (e) { err.textContent = e.message; err.hidden = false; })
+        .then(function () { busy(tgo, $('tst'), false); });
+    });
+    $('tcopy').addEventListener('click', function () { copy($('tout').textContent, $('tcopy')); });
+  }
+})();
